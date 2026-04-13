@@ -30,350 +30,47 @@ outputs:
 runs:
   using: 'composite'
   steps:
-    # ------------------------------------------------------------------
-    # Step 1: Collect all data from GitHub APIs
-    # ------------------------------------------------------------------
-    - name: "\U0001F4E6 Collect PAT audit data"
-      id: collect
-      uses: actions/github-script@v9
+    - name: Fetch Repos & Members
+      shell: bash
       env:
-        INPUT_ORG_NAME: ${{ inputs.org-name || github.repository_owner }}
-        INPUT_LOOKBACK_DAYS: ${{ inputs.lookback-days }}
-      with:
-        github-token: ${{ inputs.org-pat }}
-        script: |
-          const fs = require('fs');
-          const orgName = process.env.INPUT_ORG_NAME;
-          const lookbackDays = parseInt(process.env.INPUT_LOOKBACK_DAYS || '30');
-          const dir = 'reports';
-          fs.mkdirSync(dir, { recursive: true });
+        ORG_PAT: ${{ inputs.org-pat }}
+        ORG_NAME: ${{ inputs.org-name || github.repository_owner }}
+        LOOKBACK_DAYS: ${{ inputs.lookback-days }}
+      run: bash "${{ github.action_path }}/scripts/fetch-org-data.sh"
 
-          const now = new Date();
-          const since = new Date(now.getTime() - lookbackDays * 86400000).toISOString();
+    - name: SAML SSO Credentials
+      shell: bash
+      env:
+        ORG_PAT: ${{ inputs.org-pat }}
+        ORG_NAME: ${{ inputs.org-name || github.repository_owner }}
+        LOOKBACK_DAYS: ${{ inputs.lookback-days }}
+      run: bash "${{ github.action_path }}/scripts/saml-credentials.sh"
 
-          // Validate authentication
-          const { data: me } = await github.rest.users.getAuthenticated();
-          const { data: org } = await github.rest.orgs.get({ org: orgName });
-          core.info(`Authenticated as ${me.login} | org: ${orgName} (ID: ${org.id})`);
-          fs.writeFileSync(`${dir}/_meta.json`, JSON.stringify({
-            user: me.login, org_id: org.id, org: orgName,
-            ts: now.toISOString(), days: lookbackDays, since
-          }));
+    - name: Audit Log Events
+      shell: bash
+      env:
+        ORG_PAT: ${{ inputs.org-pat }}
+        ORG_NAME: ${{ inputs.org-name || github.repository_owner }}
+        LOOKBACK_DAYS: ${{ inputs.lookback-days }}
+      run: bash "${{ github.action_path }}/scripts/audit-log.sh"
 
-          // 1. Repositories
-          core.startGroup('Fetching repositories');
-          const repos = (await github.paginate(github.rest.repos.listForOrg, {
-            org: orgName, type: 'all', per_page: 100
-          })).map(r => ({
-            name: r.name, nameWithOwner: r.full_name,
-            isPrivate: r.private, isArchived: r.archived,
-            createdAt: r.created_at, pushedAt: r.pushed_at
-          }));
-          fs.writeFileSync(`${dir}/repositories.json`, JSON.stringify(repos));
-          core.info(`Found ${repos.length} repositories`);
-          core.endGroup();
+    - name: Workflow Secret Scanner
+      shell: bash
+      env:
+        ORG_PAT: ${{ inputs.org-pat }}
+        ORG_NAME: ${{ inputs.org-name || github.repository_owner }}
+        LOOKBACK_DAYS: ${{ inputs.lookback-days }}
+      run: bash "${{ github.action_path }}/scripts/workflow-scanner.sh"
 
-          // 2. Members with roles (GraphQL)
-          core.startGroup('Fetching members');
-          const members = [];
-          let cursor = null;
-          while (true) {
-            const q = await github.graphql(`
-              query($org: String!, $cursor: String) {
-                organization(login: $org) {
-                  membersWithRole(first: 100, after: $cursor) {
-                    pageInfo { hasNextPage endCursor }
-                    edges { role node { login name createdAt } }
-                  }
-                }
-              }`, { org: orgName, cursor });
-            for (const e of q.organization.membersWithRole.edges) {
-              members.push({ login: e.node.login, name: e.node.name, role: e.role, createdAt: e.node.createdAt });
-            }
-            if (!q.organization.membersWithRole.pageInfo.hasNextPage) break;
-            cursor = q.organization.membersWithRole.pageInfo.endCursor;
-          }
-          fs.writeFileSync(`${dir}/members.json`, JSON.stringify(members));
-          core.info(`Found ${members.length} members`);
-          core.endGroup();
-
-          // 3. SAML SSO Credentials
-          core.startGroup('Fetching SAML SSO credentials');
-          let credentials = [];
-          try {
-            credentials = await github.paginate('GET /orgs/{org}/credential-authorizations', {
-              org: orgName, per_page: 100
-            });
-          } catch (e) { core.warning(`SAML SSO: ${e.message}`); }
-          const pats = credentials.filter(c => c.credential_type === 'personal access token');
-          core.info(`Found ${credentials.length} credentials (${pats.length} PATs)`);
-          fs.writeFileSync(`${dir}/credential_authorizations.json`, JSON.stringify(credentials));
-          core.endGroup();
-
-          // 4. Audit Log - PAT lifecycle events
-          core.startGroup('Querying audit log for PAT events');
-          let patEvents = [];
-          try {
-            patEvents = await github.paginate('GET /orgs/{org}/audit-log', {
-              org: orgName,
-              phrase: `action:personal_access_token created:>=${since}`,
-              include: 'all', per_page: 100
-            });
-          } catch (e) { core.warning(`Audit log (PAT): ${e.message}`); }
-          core.info(`PAT lifecycle events: ${patEvents.length}`);
-          fs.writeFileSync(`${dir}/audit_pat_events.json`, JSON.stringify(patEvents));
-          core.endGroup();
-
-          // 5. Audit Log - All events (for token auth filtering)
-          core.startGroup('Querying audit log for token auth events');
-          let allEvents = [];
-          try {
-            allEvents = await github.paginate('GET /orgs/{org}/audit-log', {
-              org: orgName,
-              phrase: `created:>=${since}`,
-              include: 'all', per_page: 100
-            });
-          } catch (e) { core.warning(`Audit log: ${e.message}`); }
-
-          const tokenEvents = allEvents.filter(e =>
-            e.programmatic_access_type != null || e.token_id != null ||
-            e.hashed_token != null || e.actor_is_bot === true
-          );
-          core.info(`Token auth events: ${tokenEvents.length} (from ${allEvents.length} total)`);
-          fs.writeFileSync(`${dir}/audit_token_access.json`, JSON.stringify(tokenEvents));
-
-          // Actor summary
-          const actors = {};
-          for (const e of allEvents) {
-            if (!e.actor) continue;
-            const a = actors[e.actor] || (actors[e.actor] = {
-              actor: e.actor, total_events: 0, actions: new Set(),
-              timestamps: [], repos: new Set(), has_programmatic_access: false, is_bot: false
-            });
-            a.total_events++;
-            if (e.action) a.actions.add(e.action);
-            if (e['@timestamp']) a.timestamps.push(e['@timestamp']);
-            if (e.repo) a.repos.add(e.repo);
-            if (e.programmatic_access_type) a.has_programmatic_access = true;
-            if (e.actor_is_bot) a.is_bot = true;
-          }
-          const actorSummary = Object.values(actors).map(a => ({
-            actor: a.actor, total_events: a.total_events,
-            actions: [...a.actions], repos_accessed: [...a.repos],
-            first_seen: a.timestamps.length ? new Date(Math.min(...a.timestamps)).toISOString() : null,
-            last_seen: a.timestamps.length ? new Date(Math.max(...a.timestamps)).toISOString() : null,
-            has_programmatic_access: a.has_programmatic_access, is_bot: a.is_bot
-          })).sort((x, y) => y.total_events - x.total_events);
-          core.info(`Unique actors: ${actorSummary.length}`);
-          fs.writeFileSync(`${dir}/actor_summary.json`, JSON.stringify(actorSummary));
-          core.endGroup();
-
-          // 6. Workflow Secret Scanner
-          core.startGroup('Scanning workflows for custom secrets');
-          const workflowSecrets = [];
-          try {
-            let searchItems = [];
-            let searchPage = 1;
-            while (searchPage <= 10) {
-              const { data } = await github.rest.search.code({
-                q: `secrets. org:${orgName} path:.github/workflows language:yaml`,
-                per_page: 100, page: searchPage
-              });
-              searchItems.push(...data.items);
-              if (data.items.length < 100 || searchItems.length >= data.total_count) break;
-              searchPage++;
-              await new Promise(r => setTimeout(r, 6000));
-            }
-            const seen = new Set();
-            const files = searchItems.filter(f => {
-              const k = `${f.repository.full_name}:${f.path}`;
-              return seen.has(k) ? false : (seen.add(k), true);
-            });
-            core.info(`Workflow files referencing secrets: ${files.length}`);
-            let i = 0;
-            for (const f of files.slice(0, 200)) {
-              try {
-                const { data } = await github.rest.repos.getContent({
-                  owner: f.repository.owner.login, repo: f.repository.name, path: f.path
-                });
-                const content = Buffer.from(data.content, 'base64').toString();
-                const secrets = [...new Set(
-                  (content.match(/secrets\.[A-Za-z_]\w*/g) || []).map(s => s.replace('secrets.', ''))
-                )].filter(s => s.toUpperCase() !== 'GITHUB_TOKEN');
-                if (secrets.length) {
-                  workflowSecrets.push({ repo: f.repository.full_name, workflow: f.path, secrets });
-                }
-                if (++i % 10 === 0) await new Promise(r => setTimeout(r, 1000));
-              } catch { /* skip inaccessible files */ }
-            }
-          } catch (e) { core.warning(`Workflow scan: ${e.message}`); }
-          core.info(`Workflows with custom secrets: ${workflowSecrets.length}`);
-          fs.writeFileSync(`${dir}/workflow_secrets.json`, JSON.stringify(workflowSecrets));
-          core.endGroup();
-
-    # ------------------------------------------------------------------
-    # Step 2: Generate per-user matrix, report, and job summary
-    # ------------------------------------------------------------------
-    - name: "\U0001F4CA Generate report & job summary"
+    - name: Generate Report & Summary
       id: report
-      uses: actions/github-script@v9
+      shell: bash
       env:
-        INPUT_ORG_NAME: ${{ inputs.org-name || github.repository_owner }}
-        INPUT_LOOKBACK_DAYS: ${{ inputs.lookback-days }}
-      with:
-        github-token: ${{ inputs.org-pat }}
-        script: |
-          const fs = require('fs');
-          const dir = 'reports';
-          const load = f => { try { return JSON.parse(fs.readFileSync(`${dir}/${f}`)); } catch { return []; } };
-          const loadObj = f => { try { return JSON.parse(fs.readFileSync(`${dir}/${f}`)); } catch { return {}; } };
-
-          const meta = loadObj('_meta.json');
-          const repos = load('repositories.json');
-          const members = load('members.json');
-          const credentials = load('credential_authorizations.json');
-          const patEvents = load('audit_pat_events.json');
-          const tokenEvents = load('audit_token_access.json');
-          const actorSummary = load('actor_summary.json');
-          const workflowSecrets = load('workflow_secrets.json');
-
-          const patCreds = credentials.filter(c => c.credential_type === 'personal access token');
-          const orgName = meta.org || process.env.INPUT_ORG_NAME;
-          const authUser = meta.user || 'unknown';
-          const orgId = meta.org_id || '';
-          const timestamp = meta.ts || new Date().toISOString();
-          const lookbackDays = meta.days || parseInt(process.env.INPUT_LOOKBACK_DAYS || '30');
-          const since = meta.since || new Date(Date.now() - lookbackDays * 86400000).toISOString();
-
-          // Build per-user PAT matrix (PAT-active users ONLY)
-          const patUsers = new Set();
-          patCreds.forEach(c => { if (c.login) patUsers.add(c.login); });
-          patEvents.forEach(e => { if (e.actor) patUsers.add(e.actor); if (e.user) patUsers.add(e.user); });
-          tokenEvents.filter(e => !e.actor_is_bot).forEach(e => { if (e.actor) patUsers.add(e.actor); });
-          actorSummary.filter(a => a.has_programmatic_access).forEach(a => { if (a.actor) patUsers.add(a.actor); });
-
-          const memberMap = Object.fromEntries(members.map(m => [m.login, m]));
-          const matrix = [...patUsers].map(user => {
-            const uTokens = tokenEvents.filter(e => e.actor === user && !e.actor_is_bot);
-            const uCreds = patCreds.filter(c => c.login === user);
-            const m = memberMap[user] || {};
-            const ts = uTokens.map(e => e['@timestamp']).filter(Boolean);
-            return {
-              user, name: m.name || null, role: m.role || null,
-              repos: [...new Set(uTokens.map(e => e.repo).filter(Boolean))],
-              token_types: [...new Set(uTokens.map(e => e.programmatic_access_type).filter(Boolean))],
-              saml_pats: uCreds.map(c => ({
-                last8: c.token_last_eight, scopes: (c.scopes || []).join(', '),
-                accessed: c.credential_accessed_at || 'Never',
-                expires: c.authorized_credential_expires_at || 'Never'
-              })),
-              events: uTokens.length,
-              first: ts.length ? new Date(Math.min(...ts)).toISOString() : null,
-              last: ts.length ? new Date(Math.max(...ts)).toISOString() : null
-            };
-          }).sort((a, b) => b.events - a.events);
-
-          fs.writeFileSync(`${dir}/user_pat_matrix.json`, JSON.stringify(matrix, null, 2));
-          core.info(`PAT-active users: ${matrix.length}`);
-          core.setOutput('pat-active-users', matrix.length.toString());
-
-          // Helpers
-          const rl = (arr, max = 3) => !arr.length ? '\u2014' : arr.length <= max ? arr.join(', ') : arr.slice(0, max).join(', ') + ` +${arr.length - max} more`;
-          const dt = d => d ? d.substring(0, 10) : '\u2014';
-
-          // Build Markdown
-          let md = '';
-          md += `# \u{1F510} PAT Audit Report \u2014 \`${orgName}\`\n\n`;
-          md += `| | |\n|---|---|\n`;
-          md += `| **Organization** | \`${orgName}\` |\n`;
-          md += `| **Run Date** | ${timestamp} |\n`;
-          md += `| **Authenticated As** | \`${authUser}\` |\n`;
-          md += `| **Lookback** | ${lookbackDays} days (since ${dt(since)}) |\n\n`;
-          md += `---\n\n`;
-
-          md += `## \u{1F4CA} Overview\n\n`;
-          md += `| Metric | Count |\n|:-------|------:|\n`;
-          md += `| Repositories | **${repos.length}** |\n`;
-          md += `| Members | **${members.length}** |\n`;
-          md += `| **Users with PAT Activity** | **${matrix.length}** |\n`;
-          md += `| SAML SSO Authorized PATs | **${patCreds.length}** |\n`;
-          md += `| PAT Lifecycle Events | **${patEvents.length}** |\n`;
-          md += `| Token Auth Events | **${tokenEvents.length}** |\n`;
-          md += `| Workflows with Custom Secrets | **${workflowSecrets.length}** |\n\n`;
-          md += `---\n\n`;
-
-          md += `## \u{1F9D1}\u200D\u{1F4BB} Users with PAT Activity\n\n`;
-          md += `Only users who have created, used, or been associated with a PAT across any data source.\n\n`;
-          if (matrix.length) {
-            md += `| User | Name | Role | Repos Accessed via PAT | Token Type | SAML PATs | Events | Last Active |\n`;
-            md += `|:-----|:-----|:-----|:----------------------|:-----------|:---------:|-------:|:------------|\n`;
-            for (const u of matrix) {
-              md += `| \`${u.user}\` | ${u.name || '\u2014'} | ${u.role || '\u2014'} | ${rl(u.repos)} | ${u.token_types.length ? u.token_types.join(', ') : '\u2014'} | ${u.saml_pats.length} | ${u.events} | ${dt(u.last)} |\n`;
-            }
-          } else { md += `> _No users with PAT activity detected._\n`; }
-          md += `\n---\n\n`;
-
-          md += `## \u{1F511} SAML SSO Authorized Tokens\n\n`;
-          if (patCreds.length) {
-            md += `| User | Token (last 8) | Scopes | Last Accessed | Expires |\n`;
-            md += `|:-----|:--------------:|:-------|:--------------|:--------|\n`;
-            for (const c of patCreds) {
-              md += `| \`${c.login}\` | \`${c.token_last_eight}\` | ${(c.scopes||[]).join(', ')} | ${c.credential_accessed_at || 'Never'} | ${c.authorized_credential_expires_at || 'Never'} |\n`;
-            }
-          } else { md += `> _No SAML SSO authorized PATs found. Expected if SAML SSO is not enabled._\n`; }
-          md += `\n---\n\n`;
-
-          md += `## \u{1F4CB} PAT Lifecycle Events\n\n`;
-          if (patEvents.length) {
-            md += `| Date | Event | Actor | Target User | Repository |\n`;
-            md += `|:-----|:------|:------|:------------|:-----------|\n`;
-            for (const e of patEvents.slice(0, 50)) {
-              const t = e['@timestamp'] ? new Date(e['@timestamp']).toISOString() : (e.created_at || '\u2014');
-              md += `| ${dt(t)} | \`${(e.action||'').split('.').pop()}\` | \`${e.actor||'\u2014'}\` | \`${e.user||'\u2014'}\` | ${e.repo||'\u2014'} |\n`;
-            }
-            if (patEvents.length > 50) md += `\n_Showing 50 of ${patEvents.length}. Download artifact for full data._\n`;
-          } else { md += `> _No PAT lifecycle events found in the last ${lookbackDays} days._\n`; }
-          md += `\n---\n\n`;
-
-          md += `## \u{1F916} Token-Authenticated Access\n\n`;
-          if (tokenEvents.length) {
-            md += `| Date | Action | User | Repository | Token Type |\n`;
-            md += `|:-----|:-------|:-----|:-----------|:-----------|\n`;
-            for (const e of tokenEvents.slice(0, 50)) {
-              const t = e['@timestamp'] ? new Date(e['@timestamp']).toISOString() : (e.created_at || '\u2014');
-              md += `| ${dt(t)} | \`${e.action}\` | \`${e.actor||'\u2014'}\` | ${e.repo||'\u2014'} | ${e.programmatic_access_type||'classic PAT'} |\n`;
-            }
-            if (tokenEvents.length > 50) md += `\n_Showing 50 of ${tokenEvents.length}. Download artifact for full data._\n`;
-          } else { md += `> _No token-authenticated events found._\n`; }
-          md += `\n---\n\n`;
-
-          md += `## \u{1F50D} Workflows Using Custom Secrets\n\n`;
-          md += `Workflow files referencing secrets other than \`GITHUB_TOKEN\`.\n\n`;
-          if (workflowSecrets.length) {
-            md += `| Repository | Workflow | Secrets Used |\n`;
-            md += `|:-----------|:---------|:-------------|\n`;
-            for (const w of workflowSecrets.slice(0, 50)) {
-              md += `| \`${w.repo}\` | \`${w.workflow.split('/').pop()}\` | ${w.secrets.map(s => '\`' + s + '\`').join(', ')} |\n`;
-            }
-            if (workflowSecrets.length > 50) md += `\n_Showing 50 of ${workflowSecrets.length}. Download artifact for full data._\n`;
-          } else { md += `> _No workflows found using custom secrets._\n`; }
-          md += `\n---\n\n`;
-
-          md += `## \u{1F4E6} Repository Inventory\n\n`;
-          md += `| Repository | Visibility | Archived | Last Push |\n`;
-          md += `|:-----------|:-----------|:--------:|:----------|\n`;
-          for (const r of repos.slice(0, 100)) {
-            md += `| \`${r.nameWithOwner}\` | ${r.isPrivate ? '\u{1F512} Private' : '\u{1F310} Public'} | ${r.isArchived ? '\u{1F4C1} Yes' : '\u2014'} | ${dt(r.pushedAt)} |\n`;
-          }
-          if (repos.length > 100) md += `\n_Showing 100 of ${repos.length} repositories._\n`;
-          md += `\n---\n\n`;
-          md += `> \u{1F4CE} **Full data available in the workflow artifact** \u2014 download for complete JSON files.\n`;
-
-          // Write job summary
-          if (process.env.GITHUB_STEP_SUMMARY) {
-            fs.writeFileSync(process.env.GITHUB_STEP_SUMMARY, md);
-            core.info('Job summary written');
-          }
-          // Write markdown report
-          fs.writeFileSync(`${dir}/pat-audit-report.md`, md);
-          core.info(`Report: ${dir}/pat-audit-report.md`);
+        ORG_PAT: ${{ inputs.org-pat }}
+        ORG_NAME: ${{ inputs.org-name || github.repository_owner }}
+        LOOKBACK_DAYS: ${{ inputs.lookback-days }}
+      run: |
+        bash "${{ github.action_path }}/scripts/generate-report.sh"
+        # Set output
+        PAT_ACTIVE="$(jq 'length' reports/user_pat_matrix.json 2>/dev/null || echo 0)"
+        echo "pat-active-users=${PAT_ACTIVE}" >> "$GITHUB_OUTPUT"
