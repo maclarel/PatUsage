@@ -1,45 +1,24 @@
-name: PAT Audit - Organization Token Inventory & Access Report
-
+name: PAT Audit
 on:
   schedule:
     - cron: '0 8 * * 1'
   workflow_dispatch:
-    inputs:
-      org_name:
-        description: 'GitHub Organization name (overrides default)'
-        required: false
-        type: string
-      lookback_days:
-        description: 'Number of days to look back in audit log'
-        required: false
-        default: '30'
-        type: string
-
-permissions:
-  contents: read
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 jobs:
-  pat-audit:
-    name: "\U0001F510 PAT Audit"
+  audit:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Run PAT Audit
-        uses: ./
+      - uses: jackgkafaty/GitHub_PAT_AUDIT@v1
         with:
           org-pat: ${{ secrets.ORG_LEVEL_PAT }}
-          org-name: ${{ inputs.org_name || '' }}
-          lookback-days: ${{ inputs.lookback_days || '30' }}
+          # org-name: my-org        # optional, defaults to repository owner
+          # lookback-days: '30'     # optional, defaults to 30
 
-      - name: Upload Report
-        if: always()
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: pat-audit-report-${{ github.run_id }}
+          name: pat-audit-report
           path: reports/
           retention-days: 90
