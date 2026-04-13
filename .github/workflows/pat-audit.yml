@@ -1,0 +1,48 @@
+name: PAT Audit - Organization Token Inventory & Access Report
+
+on:
+  schedule:
+    # Runs every Monday at 8:00 AM UTC
+    - cron: '0 8 * * 1'
+  workflow_dispatch:
+    inputs:
+      org_name:
+        description: 'GitHub Organization name (overrides default)'
+        required: false
+        type: string
+      lookback_days:
+        description: 'Number of days to look back in audit log'
+        required: false
+        default: '30'
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  GITHUB_API_VERSION: "2026-03-10"
+
+jobs:
+  pat-audit:
+    name: Audit PATs Across Organization
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run PAT Audit Script
+        env:
+          ORG_PAT: ${{ secrets.ORG_LEVEL_PAT }}
+          ORG_NAME: ${{ inputs.org_name || vars.GITHUB_ORG_NAME }}
+          LOOKBACK_DAYS: ${{ inputs.lookback_days || '30' }}
+        run: |
+          chmod +x ./scripts/pat-audit.sh
+          ./scripts/pat-audit.sh
+
+      - name: Upload Audit Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pat-audit-report-${{ github.run_id }}
+          path: ./reports/
+          retention-days: 90

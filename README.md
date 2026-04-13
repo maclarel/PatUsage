@@ -169,7 +169,7 @@ In the repository running this action:
 
 | Secret / Variable | Type | Value |
 |---|---|---|
-| `ORG_PAT` | **Secret** | The classic PAT created above |
+| `ORG_LEVEL_PAT` | **Secret** | The classic PAT created above |
 | `GITHUB_ORG_NAME` | **Variable** | Your GitHub organization slug (e.g., `octodemo`) |
 
 ### 3. Environment Variables
@@ -189,38 +189,56 @@ The audit script uses the following environment variables:
 
 ### Run as a GitHub Action
 
-Create a workflow file (e.g., `.github/workflows/pat-audit.yml`) that:
+This repository already includes a workflow at `.github/workflows/pat-audit.yml`. It:
 
-1. Checks out this repository.
-2. Sets the required environment variables from secrets/variables.
-3. Runs `scripts/pat-audit.sh`.
-4. Uploads the `reports/` directory as a workflow artifact.
+- Runs weekly on Mondays at 08:00 UTC (and supports `workflow_dispatch` with optional org name and lookback overrides).
+- Reads the PAT from `secrets.ORG_LEVEL_PAT` and the org name from `vars.GITHUB_ORG_NAME`.
+- Uploads the `reports/` directory as an artifact retained for 90 days.
 
 ```yaml
-name: PAT Audit
+# .github/workflows/pat-audit.yml (included in this repo)
+name: PAT Audit - Organization Token Inventory & Access Report
+
 on:
   schedule:
-    - cron: '0 6 * * 1'   # Weekly on Monday at 06:00 UTC
+    - cron: '0 8 * * 1'
   workflow_dispatch:
+    inputs:
+      org_name:
+        description: 'GitHub Organization name (overrides default)'
+        required: false
+        type: string
+      lookback_days:
+        description: 'Number of days to look back in audit log'
+        required: false
+        default: '30'
+        type: string
+
+permissions:
+  contents: read
 
 jobs:
-  audit:
+  pat-audit:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run PAT Audit
+      - name: Run PAT Audit Script
         env:
-          ORG_PAT: ${{ secrets.ORG_PAT }}
-          ORG_NAME: ${{ vars.GITHUB_ORG_NAME }}
-          LOOKBACK_DAYS: 30
-        run: bash scripts/pat-audit.sh
+          ORG_PAT: ${{ secrets.ORG_LEVEL_PAT }}
+          ORG_NAME: ${{ inputs.org_name || vars.GITHUB_ORG_NAME }}
+          LOOKBACK_DAYS: ${{ inputs.lookback_days || '30' }}
+        run: |
+          chmod +x ./scripts/pat-audit.sh
+          ./scripts/pat-audit.sh
 
-      - name: Upload Report
+      - name: Upload Audit Report
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pat-audit-report
-          path: reports/
+          name: pat-audit-report-${{ github.run_id }}
+          path: ./reports/
+          retention-days: 90
 ```
 
 ### Run Locally
@@ -268,6 +286,9 @@ After execution, the `reports/` directory contains:
 
 ```
 PatUsage/
+├── .github/
+│   └── workflows/
+│       └── pat-audit.yml      # GitHub Actions workflow (scheduled + manual)
 ├── README.md                  # This file
 ├── FEASIBILITY-REVIEW.md      # Detailed API feasibility analysis and setup guide
 ├── scripts/
