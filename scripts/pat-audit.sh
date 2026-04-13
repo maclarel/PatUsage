@@ -332,10 +332,196 @@ echo "   Identified ${ACTOR_COUNT} unique actors in audit log"
 echo "${ACTOR_SUMMARY}" | jq '.' > "${ACTOR_SUMMARY_FILE}"
 
 # =============================================================================
-# SECTION 8: Generate Consolidated Report
+# SECTION 8: Workflow PAT Scanner
+# Scans all org repos for workflow files that reference secrets other than
+# GITHUB_TOKEN — indicating a user-created PAT or custom token is in use.
+# Uses GitHub Code Search API for efficiency.
 # =============================================================================
 echo ""
-echo ">> Step 8: Generating consolidated report..."
+echo ">> Step 8: Scanning org workflows for PAT/secret usage..."
+
+WORKFLOW_SECRETS_FILE="${REPORT_DIR}/workflow_secrets.json"
+
+# Use code search to find workflow files referencing secrets
+SEARCH_RESULTS="[]"
+SEARCH_PAGE=1
+SEARCH_MAX_PAGES=10
+
+while [[ $SEARCH_PAGE -le $SEARCH_MAX_PAGES ]]; do
+  SEARCH_RESPONSE="$(gh_rest GET "/search/code?q=secrets.+org:${ORG_NAME}+path:.github/workflows+language:yaml&per_page=100&page=${SEARCH_PAGE}" 2>/dev/null || echo '{"items":[]}')"
+
+  SEARCH_BATCH="$(echo "${SEARCH_RESPONSE}" | jq '.items // []')"
+  BATCH_COUNT="$(echo "${SEARCH_BATCH}" | jq 'length')"
+
+  if [[ "${BATCH_COUNT}" -eq 0 ]]; then
+    break
+  fi
+
+  SEARCH_RESULTS="$(echo "${SEARCH_RESULTS}" "${SEARCH_BATCH}" | jq -s '.[0] + .[1]')"
+  SEARCH_PAGE=$((SEARCH_PAGE + 1))
+
+  # Code search rate limit: pause briefly between pages
+  sleep 2
+
+  if [[ "${BATCH_COUNT}" -lt 100 ]]; then
+    break
+  fi
+done
+
+# For each matched file, fetch content and extract secret names
+WORKFLOW_SECRETS="[]"
+PROCESSED_FILES="[]"
+
+# Get unique repo+path combinations
+UNIQUE_FILES="$(echo "${SEARCH_RESULTS}" | jq -r '[.[] | {repo: .repository.full_name, path: .path, html_url: .html_url}] | unique_by(.repo + .path)')"
+UNIQUE_FILE_COUNT="$(echo "${UNIQUE_FILES}" | jq 'length')"
+
+echo "   Found ${UNIQUE_FILE_COUNT} workflow files referencing secrets"
+
+# Process each file (limit to 200 to avoid rate limits)
+PROCESS_LIMIT=200
+PROCESSED=0
+
+echo "${UNIQUE_FILES}" | jq -c '.[0:200] | .[]' 2>/dev/null | while IFS= read -r file_info; do
+  REPO_FULL="$(echo "${file_info}" | jq -r '.repo')"
+  FILE_PATH="$(echo "${file_info}" | jq -r '.path')"
+
+  # Fetch file content via Contents API
+  FILE_CONTENT="$(gh_rest GET "/repos/${REPO_FULL}/contents/${FILE_PATH}" 2>/dev/null || echo '{}')"
+  DECODED="$(echo "${FILE_CONTENT}" | jq -r '.content // ""' | base64 -d 2>/dev/null || echo "")"
+
+  if [[ -z "${DECODED}" ]]; then
+    continue
+  fi
+
+  # Extract all secrets.XXXX references, excluding GITHUB_TOKEN and github.token
+  SECRET_NAMES="$(echo "${DECODED}" | grep -oE 'secrets\.[A-Za-z_][A-Za-z0-9_]*' | sed 's/secrets\.//' | sort -u | grep -iv '^GITHUB_TOKEN$' || true)"
+
+  if [[ -n "${SECRET_NAMES}" ]]; then
+    # Build JSON array of secret names
+    SECRET_JSON="$(echo "${SECRET_NAMES}" | jq -R -s 'split("\n") | map(select(length > 0))')"
+
+    # Extract env var mappings: ENV_VAR: ${{ secrets.XXX }} patterns
+    ENV_MAPPINGS="$(echo "${DECODED}" | grep -E '^\s+\w+:.*\$\{\{\s*secrets\.' | sed 's/^[[:space:]]*//' | head -20 || true)"
+    ENV_JSON="$(echo "${ENV_MAPPINGS}" | jq -R -s 'split("\n") | map(select(length > 0))')"
+
+    echo "{\"repo\": \"${REPO_FULL}\", \"workflow\": \"${FILE_PATH}\", \"secrets\": ${SECRET_JSON}, \"env_mappings\": ${ENV_JSON}}" >> "${REPORT_DIR}/_wf_tmp.jsonl"
+  fi
+
+  PROCESSED=$((PROCESSED + 1))
+  # Brief pause every 10 files to avoid rate limiting
+  if [[ $((PROCESSED % 10)) -eq 0 ]]; then
+    sleep 1
+  fi
+done
+
+# Consolidate workflow secrets data
+if [[ -f "${REPORT_DIR}/_wf_tmp.jsonl" ]]; then
+  WORKFLOW_SECRETS="$(cat "${REPORT_DIR}/_wf_tmp.jsonl" | jq -s '.' 2>/dev/null || echo "[]")"
+  rm -f "${REPORT_DIR}/_wf_tmp.jsonl"
+else
+  WORKFLOW_SECRETS="[]"
+fi
+
+WORKFLOW_SECRET_COUNT="$(echo "${WORKFLOW_SECRETS}" | jq 'length')"
+echo "   Found ${WORKFLOW_SECRET_COUNT} workflows using custom secrets (non-GITHUB_TOKEN)"
+echo "${WORKFLOW_SECRETS}" | jq '.' > "${WORKFLOW_SECRETS_FILE}"
+
+# =============================================================================
+# SECTION 9: Per-User PAT Activity Matrix
+# Cross-references all data sources to build a per-user view:
+#   - Which repos the user accessed with a PAT (from audit log)
+#   - Which repos contain workflows referencing secrets (possible PAT usage)
+#   - SAML SSO credential info
+# =============================================================================
+echo ""
+echo ">> Step 9: Building per-user PAT activity matrix..."
+
+USER_PAT_MATRIX_FILE="${REPORT_DIR}/user_pat_matrix.json"
+
+# Build per-user PAT access from audit log (non-bot actors with token indicators)
+USER_PAT_ACCESS="$(echo "${TOKEN_ACCESS_EVENTS}" | jq '
+  [.[] | select(
+    (.actor_is_bot != true) and
+    (.programmatic_access_type != null or .hashed_token != null or .token_id != null)
+  )] |
+  group_by(.actor) |
+  map({
+    user: .[0].actor,
+    repos_accessed_with_pat: ([.[].repo // empty] | unique),
+    token_types_used: ([.[].programmatic_access_type // empty] | unique),
+    actions_performed: ([.[].action] | unique),
+    event_count: length,
+    first_activity: ([.[]."@timestamp"] | min | . / 1000 | todate),
+    last_activity: ([.[]."@timestamp"] | max | . / 1000 | todate)
+  }) |
+  sort_by(-.event_count)
+' 2>/dev/null || echo "[]")"
+
+# Merge with SAML SSO credential data
+USER_PAT_MATRIX="$(echo "${USER_PAT_ACCESS}" | jq --argjson creds "${PAT_CREDS}" --argjson wf "${WORKFLOW_SECRETS}" '
+  # Build lookup of SAML credentials by user
+  ($creds | group_by(.login) | map({key: .[0].login, value: .}) | from_entries) as $cred_map |
+  # Build lookup of workflow secrets by repo
+  ($wf | group_by(.repo) | map({key: .[0].repo, value: [.[].secrets[]] | unique}) | from_entries) as $wf_map |
+  # Get all unique users from all sources
+  (
+    [.[].user] +
+    [$creds[].login // empty] +
+    [keys[]]
+  ) | unique | map(select(. != null and . != "")) |
+  # Build matrix for each user
+  map(. as $user |
+    {
+      user: $user,
+      repos_accessed_with_pat: (
+        [($[] | select(.user == $user))][0].repos_accessed_with_pat // []
+      ),
+      token_types_used: (
+        [($[] | select(.user == $user))][0].token_types_used // []
+      ),
+      actions_performed: (
+        [($[] | select(.user == $user))][0].actions_performed // []
+      ),
+      audit_event_count: (
+        [($[] | select(.user == $user))][0].event_count // 0
+      ),
+      first_activity: (
+        [($[] | select(.user == $user))][0].first_activity // null
+      ),
+      last_activity: (
+        [($[] | select(.user == $user))][0].last_activity // null
+      ),
+      saml_pats: (
+        [$cred_map[$user] // [] | .[] | {
+          token_last_eight: .token_last_eight,
+          scopes: (.scopes | join(", ")),
+          last_accessed: (.credential_accessed_at // "Never"),
+          expires: (.authorized_credential_expires_at // "Never")
+        }]
+      ),
+      repos_with_user_workflows: (
+        [$wf[] | select(.secrets | length > 0) | .repo] | unique
+      )
+    }
+  ) |
+  sort_by(-.audit_event_count)
+' 2>/dev/null || echo "${USER_PAT_ACCESS}")"
+
+# Simpler fallback if the complex merge fails
+if [[ "$(echo "${USER_PAT_MATRIX}" | jq 'length' 2>/dev/null || echo 0)" -eq 0 ]] && [[ "$(echo "${USER_PAT_ACCESS}" | jq 'length' 2>/dev/null || echo 0)" -gt 0 ]]; then
+  USER_PAT_MATRIX="${USER_PAT_ACCESS}"
+fi
+
+USER_MATRIX_COUNT="$(echo "${USER_PAT_MATRIX}" | jq 'length' 2>/dev/null || echo "0")"
+echo "   Built activity matrix for ${USER_MATRIX_COUNT} users"
+echo "${USER_PAT_MATRIX}" | jq '.' > "${USER_PAT_MATRIX_FILE}"
+
+# =============================================================================
+# SECTION 10: Generate Consolidated Report
+# =============================================================================
+echo ""
+echo ">> Step 10: Generating consolidated report..."
 
 REPORT_FILE="${REPORT_DIR}/pat-audit-report.md"
 
@@ -451,23 +637,63 @@ cat >> "${REPORT_FILE}" << 'SECTION5'
 
 ---
 
-## 5. Organization Members
+## 5. Workflows Using Custom Secrets (PAT Detection)
 
-| Login | Name | Role | Account Created |
-|-------|------|------|----------------|
+Workflows across the organization that reference secrets other than `GITHUB_TOKEN`,
+indicating a user-created PAT or custom token may be in use.
+
 SECTION5
 
-echo "${ALL_MEMBERS}" | jq -r '.[] | "| \(.login) | \(.name // "—") | \(.role // "—") | \(.createdAt // "—") |"' >> "${REPORT_FILE}" 2>/dev/null || true
+if [[ "${WORKFLOW_SECRET_COUNT}" -gt 0 ]]; then
+  echo "| Repository | Workflow File | Secrets Referenced |" >> "${REPORT_FILE}"
+  echo "|-----------|--------------|-------------------|" >> "${REPORT_FILE}"
+
+  echo "${WORKFLOW_SECRETS}" | jq -r '.[] | "| \(.repo) | `\(.workflow)` | \(.secrets | map("`\(.)`") | join(", ")) |"' >> "${REPORT_FILE}" 2>/dev/null || true
+else
+  echo "_No workflows found using custom secrets (non-GITHUB_TOKEN)._" >> "${REPORT_FILE}"
+fi
 
 cat >> "${REPORT_FILE}" << 'SECTION6'
 
 ---
 
-## 6. Repository Inventory
+## 6. Per-User PAT Activity Matrix
+
+Shows each user's PAT footprint: repos accessed with a token, token types used,
+SAML-authorized PATs, and repos containing workflows that use custom secrets.
+
+SECTION6
+
+if [[ "${USER_MATRIX_COUNT}" -gt 0 ]]; then
+  echo "| User | Repos Accessed via PAT | Token Types | Events | First Active | Last Active |" >> "${REPORT_FILE}"
+  echo "|------|----------------------|-------------|--------|-------------|-------------|" >> "${REPORT_FILE}"
+
+  echo "${USER_PAT_MATRIX}" | jq -r '.[] | "| \(.user) | \(.repos_accessed_with_pat | if length > 3 then (.[0:3] | join(", ")) + " +\(length - 3) more" else join(", ") end) | \(.token_types_used | if length > 0 then join(", ") else "—" end) | \(.audit_event_count // .event_count // 0) | \(.first_activity // "—") | \(.last_activity // "—") |"' >> "${REPORT_FILE}" 2>/dev/null || true
+else
+  echo "_No per-user PAT activity detected in the audit log._" >> "${REPORT_FILE}"
+fi
+
+cat >> "${REPORT_FILE}" << 'SECTION7'
+
+---
+
+## 7. Organization Members
+
+| Login | Name | Role | Account Created |
+|-------|------|------|----------------|
+SECTION7
+
+echo "${ALL_MEMBERS}" | jq -r '.[] | "| \(.login) | \(.name // "—") | \(.role // "—") | \(.createdAt // "—") |"' >> "${REPORT_FILE}" 2>/dev/null || true
+
+cat >> "${REPORT_FILE}" << 'SECTION8'
+
+---
+
+## 8. Repository Inventory
 
 | Repository | Private | Archived | Last Push |
 |-----------|---------|----------|-----------|
-SECTION6
+SECTION8
 
 echo "${ALL_REPOS}" | jq -r '.[] | "| \(.nameWithOwner) | \(.isPrivate) | \(.isArchived) | \(.pushedAt // "Never") |"' >> "${REPORT_FILE}" 2>/dev/null || true
 
@@ -487,6 +713,8 @@ The following JSON data files are included in this artifact:
 | `audit_pat_events.json` | Audit log events related to PAT lifecycle |
 | `audit_token_access.json` | Audit log events with token-based authentication |
 | `actor_summary.json` | Aggregated actor activity summary |
+| `workflow_secrets.json` | Workflows using custom secrets (PAT detection) |
+| `user_pat_matrix.json` | Per-user PAT activity matrix |
 
 ---
 
@@ -500,11 +728,11 @@ echo "  Data files in: ${REPORT_DIR}/"
 echo "============================================"
 
 # =============================================================================
-# SECTION 9: GitHub Actions Job Summary (rendered in the Actions UI)
+# SECTION 11: GitHub Actions Job Summary (rendered in the Actions UI)
 # =============================================================================
 if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
   echo ""
-  echo ">> Step 9: Writing GitHub Actions Job Summary..."
+  echo ">> Step 11: Writing GitHub Actions Job Summary..."
 
   SUMMARY="${GITHUB_STEP_SUMMARY}"
 
@@ -531,6 +759,8 @@ if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
 | PAT Lifecycle Audit Events | **${PAT_AUDIT_COUNT}** |
 | Token Auth Audit Events | **${TOKEN_AUTH_COUNT}** |
 | Unique Actors in Audit Log | **${ACTOR_COUNT}** |
+| Workflows Using Custom Secrets | **${WORKFLOW_SECRET_COUNT}** |
+| Users with PAT Activity | **${USER_MATRIX_COUNT}** |
 
 ---
 
@@ -624,9 +854,53 @@ ACTOR_HEADER
 
 ---
 
-## 👥 Organization Members
+## � Workflows Using Custom Secrets (PAT Detection)
+
+Workflow files that reference secrets other than `GITHUB_TOKEN` — these likely use a user-created PAT or custom token.
 
 MEMBERS_HEADER
+
+  if [[ "${WORKFLOW_SECRET_COUNT}" -gt 0 ]]; then
+    echo "| Repository | Workflow | Secrets Used |" >> "${SUMMARY}"
+    echo "|:-----------|:---------|:-------------|" >> "${SUMMARY}"
+    echo "${WORKFLOW_SECRETS}" | jq -r '.[0:50] | .[] |
+      "| `\(.repo)` | `\(.workflow | split("/") | last)` | \(.secrets | map("`\(.)`") | join(", ")) |"
+    ' >> "${SUMMARY}" 2>/dev/null || true
+    if [[ "${WORKFLOW_SECRET_COUNT}" -gt 50 ]]; then
+      echo "" >> "${SUMMARY}"
+      echo "_Showing 50 of ${WORKFLOW_SECRET_COUNT} workflows. Download the artifact for the full list._" >> "${SUMMARY}"
+    fi
+  else
+    echo "> _No workflows found using custom secrets._" >> "${SUMMARY}"
+  fi
+
+  cat >> "${SUMMARY}" << 'USER_MATRIX_HEADER'
+
+---
+
+## 🧑‍💻 Per-User PAT Activity
+
+Which repos each user accessed using a PAT, what token types were used, and when they were last active.
+
+USER_MATRIX_HEADER
+
+  if [[ "${USER_MATRIX_COUNT}" -gt 0 ]]; then
+    echo "| User | Repos Accessed via PAT | Token Type | Events | Last Active |" >> "${SUMMARY}"
+    echo "|:-----|:----------------------|:-----------|-------:|:------------|" >> "${SUMMARY}"
+    echo "${USER_PAT_MATRIX}" | jq -r '.[] |
+      "| `\(.user)` | \(.repos_accessed_with_pat | if length == 0 then "—" elif length > 3 then (.[0:3] | join(", ")) + " +\(length - 3) more" else join(", ") end) | \(.token_types_used | if length > 0 then join(", ") else "—" end) | \(.audit_event_count // .event_count // 0) | \(.last_activity // "—") |"
+    ' >> "${SUMMARY}" 2>/dev/null || true
+  else
+    echo "> _No per-user PAT activity detected._" >> "${SUMMARY}"
+  fi
+
+  cat >> "${SUMMARY}" << 'MEMBERS_HEADER2'
+
+---
+
+## 👥 Organization Members
+
+MEMBERS_HEADER2
 
   echo "| User | Name | Role | Account Created |" >> "${SUMMARY}"
   echo "|:-----|:-----|:-----|:----------------|" >> "${SUMMARY}"
